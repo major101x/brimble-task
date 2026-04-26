@@ -1,5 +1,12 @@
-FROM node:22-alpine
+FROM node:22 AS builder
 WORKDIR /app
+
+COPY package*.json ./
+RUN npm install
+
 COPY . .
-RUN echo '{"name":"frontend","version":"1.0.0"}' > package.json
-CMD ["node", "src/index.js"]
+RUN npm run build
+
+FROM caddy:2-alpine
+COPY --from=builder /app/dist /srv
+CMD ["caddy", "file-server", "--root", "/srv", "--listen", ":4000"]
