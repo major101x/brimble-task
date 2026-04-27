@@ -1,7 +1,10 @@
 import { Injectable } from '@nestjs/common';
 import { randomUUID } from 'crypto';
+import { mkdtempSync, rmSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
 import { Response } from 'express';
-import { execFile } from 'child_process';
+import { execFile, spawn } from 'child_process';
 import db from './database';
 
 export interface Deployment {
@@ -16,10 +19,8 @@ export interface Deployment {
 
 @Injectable()
 export class DeploymentsService {
-  // In-memory map of deployment ID to list of SSE response objects.
-  // When a build produces a log line, we iterate this map and push
-  // to every connected client watching that deployment.
   private logStreams = new Map<string, Response[]>();
+  private logBuffer = new Map<string, string[]>();
 
   findAll(): Deployment[] {
     return db
@@ -59,8 +60,11 @@ export class DeploymentsService {
     return deployment;
   }
 
-  // Register an SSE client for a specific deployment.
   addLogStream(id: string, res: Response): void {
+    // Replay buffered lines so late-connecting clients catch up.
+    for (const line of this.logBuffer.get(id) ?? []) {
+      res.write(`data: ${JSON.stringify({ line })}\n\n`);
+    }
     if (!this.logStreams.has(id)) {
       this.logStreams.set(id, []);
     }
@@ -76,8 +80,9 @@ export class DeploymentsService {
     );
   }
 
-  // Push a log line to every connected SSE client for this deployment.
   private pushLog(id: string, line: string): void {
+    if (!this.logBuffer.has(id)) this.logBuffer.set(id, []);
+    this.logBuffer.get(id)!.push(line);
     const streams = this.logStreams.get(id) ?? [];
     for (const res of streams) {
       res.write(`data: ${JSON.stringify({ line })}\n\n`);
@@ -106,46 +111,45 @@ export class DeploymentsService {
   private async runPipeline(deployment: Deployment): Promise<void> {
     const { id, source } = deployment;
     const imageTag = `deployment-${id}`;
+    const isGitUrl = /^https?:\/\/|^git@/.test(source);
+    let cloneDir: string | null = null;
 
     try {
       // Phase 1: Build
       this.updateStatus(id, 'building');
-      await this.buildImage(id, source, imageTag);
+
+      let buildSource = source;
+      if (isGitUrl) {
+        cloneDir = mkdtempSync(join(tmpdir(), 'deploy-'));
+        this.pushLog(id, `[clone] ${source}`);
+        await this.cloneRepo(id, source, cloneDir);
+        buildSource = cloneDir;
+      }
+
+      await this.buildImage(id, buildSource, imageTag);
       this.updateImageTag(id, imageTag);
 
       // Phase 2: Deploy
       this.updateStatus(id, 'deploying');
-      const port = await this.runContainer(id, imageTag);
+      await this.runContainer(id, imageTag);
       const url = `http://localhost/deploy/${id}`;
       this.updateUrl(id, url);
 
       // Phase 3: Update Caddy routing
-      await this.updateCaddyRoute(id, port);
+      await this.updateCaddyRoute(id);
 
       this.updateStatus(id, 'running');
     } catch (err) {
       this.pushLog(id, `[error] ${(err as Error).message}`);
       this.updateStatus(id, 'failed');
+    } finally {
+      if (cloneDir) rmSync(cloneDir, { recursive: true, force: true });
     }
   }
 
-  private buildImage(
-    id: string,
-    source: string,
-    imageTag: string,
-  ): Promise<void> {
+  private cloneRepo(id: string, url: string, dest: string): Promise<void> {
     return new Promise((resolve, reject) => {
-      // We need BuildKit running for Railpack. The BUILDKIT_HOST env var
-      // tells Railpack where to find the BuildKit daemon.
-      const env = {
-        ...process.env,
-        BUILDKIT_HOST:
-          process.env.BUILDKIT_HOST ?? 'docker-container://buildkit',
-      };
-
-      const proc = execFile('railpack', ['build', '--name', imageTag, source], {
-        env,
-      });
+      const proc = execFile('git', ['clone', '--depth', '1', url, dest]);
 
       proc.stdout?.on('data', (chunk: Buffer) => {
         const lines = chunk.toString().split('\n').filter(Boolean);
@@ -158,6 +162,43 @@ export class DeploymentsService {
       });
 
       proc.on('close', (code) => {
+        if (code === 0) resolve();
+        else reject(new Error(`git clone exited with code ${code}`));
+      });
+    });
+  }
+
+  private buildImage(
+    id: string,
+    source: string,
+    imageTag: string,
+  ): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const env = {
+        ...process.env,
+        BUILDKIT_HOST:
+          process.env.BUILDKIT_HOST ?? 'docker-container://buildkit',
+      };
+
+      // Railpack handles exporting the image to Docker internally via the
+      // BuildKit daemon — no `docker load` needed. Both stdout and stderr
+      // carry human-readable progress we can stream directly to the client.
+      const railpack = spawn(
+        'railpack',
+        ['build', '--name', imageTag, source],
+        { env },
+      );
+
+      const logChunk = (chunk: Buffer) => {
+        const lines = chunk.toString().split('\n').filter(Boolean);
+        for (const line of lines) this.pushLog(id, line);
+      };
+
+      railpack.stdout.on('data', logChunk);
+      railpack.stderr.on('data', logChunk);
+
+      railpack.on('error', (err) => reject(err));
+      railpack.on('close', (code) => {
         if (code === 0) resolve();
         else reject(new Error(`Railpack exited with code ${code}`));
       });
@@ -189,24 +230,24 @@ export class DeploymentsService {
     });
   }
 
-  private updateCaddyRoute(id: string, port: number): Promise<void> {
-    // Caddy exposes an admin API on port 2019 that lets you add routes
-    // at runtime without restarting or reloading the entire config.
-    // We use this to dynamically register a reverse proxy route for each deployment.
-    return fetch(`http://caddy:2019/config/apps/http/servers/srv0/routes`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        match: [{ path: [`/deploy/${id}/*`] }],
-        handle: [
-          {
-            handler: 'reverse_proxy',
-            upstreams: [{ dial: `backend:${port}` }],
-          },
-        ],
-      }),
-    }).then((res) => {
-      if (!res.ok) throw new Error(`Caddy admin API returned ${res.status}`);
+  private async updateCaddyRoute(id: string): Promise<void> {
+    const headers = { 'Content-Type': 'application/json', Origin: 'http://caddy:2019' };
+    const base = 'http://caddy:2019/config/apps/http/servers/srv0/routes';
+
+    const existing = await fetch(base, { headers }).then((r) => r.json());
+
+    const newRoute = {
+      match: [{ path: [`/deploy/${id}`, `/deploy/${id}/*`] }],
+      handle: [{ handler: 'reverse_proxy', upstreams: [{ dial: `deployment-${id}:3000` }] }],
+    };
+
+    // Prepend so the deployment route is evaluated before the frontend catch-all.
+    const res = await fetch(base, {
+      method: 'PATCH',
+      headers,
+      body: JSON.stringify([newRoute, ...existing]),
     });
+
+    if (!res.ok) throw new Error(`Caddy admin API returned ${res.status}`);
   }
 }

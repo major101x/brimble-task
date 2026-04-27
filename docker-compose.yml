@@ -1,8 +1,23 @@
 services:
+  buildkit:
+    image: moby/buildkit
+    privileged: true
+    command: ["--addr", "tcp://0.0.0.0:1234"]
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+    networks:
+      - app-network
   backend:
     build: ./backend
+    environment:
+      - BUILDKIT_HOST=tcp://buildkit:1234
     volumes:
       - backend-data:/app/data
+      - /var/run/docker.sock:/var/run/docker.sock
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
     networks:
       - app-network
 
