@@ -48,8 +48,6 @@ export default function App() {
 
   // Poll for deployments every 3 seconds so status updates appear
   // automatically without the user having to refresh.
-  // TanStack Query handles the polling interval, deduplication,
-  // and cache invalidation for us.
   const { data: deployments = [], isLoading } = useQuery({
     queryKey: ["deployments"],
     queryFn: fetchDeployments,
@@ -59,18 +57,15 @@ export default function App() {
   const mutation = useMutation({
     mutationFn: createDeployment,
     onSuccess: () => {
-      // Immediately invalidate the deployments cache so the new
-      // deployment appears in the list without waiting for the next poll.
       queryClient.invalidateQueries({ queryKey: ["deployments"] });
       setName("");
       setSource("");
     },
   });
 
-  // This effect manages the SSE connection for the active log stream.
-  // It runs whenever activeLogId changes — opening a new EventSource
-  // when the user selects a deployment, and closing the previous one
-  // to prevent memory leaks and stale connections.
+  // Manages the SSE connection for the active log stream.
+  // Opens a new EventSource when the user selects a deployment,
+  // and closes the previous one to prevent memory leaks.
   useEffect(() => {
     if (!activeLogId) return;
 
@@ -80,23 +75,14 @@ export default function App() {
       const { line } = JSON.parse(event.data);
       setLogs((prev) => ({
         ...prev,
-        // We append to the existing lines for this deployment ID
-        // rather than replacing them, so scrolling back through
-        // earlier output still works after new lines arrive.
         [activeLogId]: [...(prev[activeLogId] ?? []), line],
       }));
     };
 
     es.onerror = () => {
-      // The EventSource will attempt to reconnect automatically on error.
-      // We don't need to handle reconnection manually — that's one of the
-      // main advantages of SSE over raw WebSockets for this use case.
       es.close();
     };
 
-    // The cleanup function returned from useEffect runs when the component
-    // unmounts OR when activeLogId changes before the next render.
-    // This is what prevents multiple simultaneous EventSource connections.
     return () => es.close();
   }, [activeLogId]);
 
@@ -110,137 +96,166 @@ export default function App() {
     mutation.mutate({ name, source });
   }
 
-  return (
-    <div
-      style={{
-        maxWidth: 900,
-        margin: "0 auto",
-        padding: "2rem",
-        fontFamily: "monospace",
-      }}
-    >
-      <h1>Brimble Task — Deployment Pipeline</h1>
+  const activeDeploymentName =
+    deployments.find((d) => d.id === activeLogId)?.name ?? activeLogId;
 
-      {/* Deployment form */}
-      <section style={{ marginBottom: "2rem" }}>
-        <h2>New Deployment</h2>
-        <div
-          style={{
-            display: "flex",
-            gap: "0.5rem",
-            flexWrap: "wrap",
-            marginTop: "0.5rem",
+  return (
+    <div className="app">
+      {/* Header */}
+      <header className="app-header">
+        <div className="app-logo" aria-hidden="true">
+          <svg
+            viewBox="0 0 24 24"
+            fill="none"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          >
+            <path d="M5 12h14M12 5l7 7-7 7" />
+          </svg>
+        </div>
+        <div>
+          <div className="app-title">Brimble Task</div>
+          <div className="app-subtitle">deployment pipeline</div>
+        </div>
+      </header>
+
+      {/* New Deployment form */}
+      <section className="section">
+        <p className="section-title">New Deployment</p>
+        <form
+          className="deploy-form"
+          onSubmit={(e) => {
+            e.preventDefault();
+            handleSubmit();
           }}
         >
-          <input
-            placeholder="Name"
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-            style={{ padding: "0.5rem", flex: 1 }}
-          />
-          <input
-            placeholder="Git URL or local path"
-            value={source}
-            onChange={(e) => setSource(e.target.value)}
-            style={{ padding: "0.5rem", flex: 2 }}
-          />
+          <div className="form-field">
+            <label className="form-label" htmlFor="deploy-name">
+              Name
+            </label>
+            <input
+              id="deploy-name"
+              className="form-input"
+              placeholder="my-app"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+            />
+          </div>
+          <div className="form-field form-field--wide">
+            <label className="form-label" htmlFor="deploy-source">
+              Source
+            </label>
+            <input
+              id="deploy-source"
+              className="form-input"
+              placeholder="https://github.com/org/repo"
+              value={source}
+              onChange={(e) => setSource(e.target.value)}
+            />
+          </div>
           <button
-            onClick={handleSubmit}
+            type="submit"
+            className="btn-deploy"
             disabled={mutation.isPending}
-            style={{ padding: "0.5rem 1rem" }}
           >
-            {mutation.isPending ? "Deploying..." : "Deploy"}
+            {mutation.isPending ? "Deploying…" : "Deploy"}
           </button>
-        </div>
+        </form>
         {mutation.isError && (
-          <p style={{ color: "red" }}>{(mutation.error as Error).message}</p>
+          <p className="form-error">{(mutation.error as Error).message}</p>
         )}
       </section>
 
       {/* Deployments list */}
-      <section style={{ marginBottom: "2rem" }}>
-        <h2>Deployments</h2>
-        {isLoading && <p>Loading...</p>}
-        {deployments.length === 0 && !isLoading && <p>No deployments yet.</p>}
-        {deployments.map((d) => (
-          <div
-            key={d.id}
-            style={{
-              border: "1px solid #ccc",
-              padding: "1rem",
-              marginTop: "0.5rem",
-              borderLeft: `4px solid ${statusColor(d.status)}`,
-            }}
-          >
-            <strong>{d.name}</strong>
-            <span style={{ marginLeft: "1rem", color: statusColor(d.status) }}>
-              {d.status}
-            </span>
-            {d.image_tag && (
-              <span style={{ marginLeft: "1rem", color: "#666" }}>
-                image: {d.image_tag}
-              </span>
-            )}
-            {d.url && (
-              <a
-                href={d.url}
-                target="_blank"
-                rel="noreferrer"
-                style={{ marginLeft: "1rem" }}
-              >
-                open →
-              </a>
-            )}
-            <div
-              style={{
-                fontSize: "0.8rem",
-                color: "#999",
-                marginTop: "0.25rem",
-              }}
-            >
-              {d.id} · {new Date(d.created_at).toLocaleString()}
+      <section className="section">
+        <p className="section-title">Deployments</p>
+        <div className="deployments-list">
+          {isLoading && (
+            <div className="deployment-loading">Loading…</div>
+          )}
+          {!isLoading && deployments.length === 0 && (
+            <div className="deployment-empty">
+              No deployments yet. Push your first one above.
             </div>
-            <button
-              onClick={() => setActiveLogId(d.id)}
-              style={{
-                marginTop: "0.5rem",
-                padding: "0.25rem 0.75rem",
-                fontSize: "0.85rem",
-              }}
-            >
-              View Logs
-            </button>
-          </div>
-        ))}
+          )}
+          {deployments.map((d) => (
+            <div key={d.id} className="deployment-card">
+              <div className="deployment-card-top">
+                <span className="deployment-name">{d.name}</span>
+                <span className={`status-badge status-badge--${d.status}`}>
+                  {d.status}
+                </span>
+                {d.image_tag && (
+                  <span className="deployment-image-tag">{d.image_tag}</span>
+                )}
+                {d.url && (
+                  <a
+                    href={d.url}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="deployment-url"
+                    aria-label={`Open ${d.name}`}
+                  >
+                    open ↗
+                  </a>
+                )}
+              </div>
+              <div className="deployment-card-bottom">
+                <span className="deployment-meta">
+                  <span>{d.id}</span>
+                  <span className="deployment-meta-sep">·</span>
+                  <span>{new Date(d.created_at).toLocaleString()}</span>
+                </span>
+                <button
+                  className="btn-logs"
+                  onClick={() => setActiveLogId(d.id)}
+                  aria-label={`View logs for ${d.name}`}
+                >
+                  View Logs
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
       </section>
 
-      {/* Log panel */}
+      {/* Log terminal panel */}
       {activeLogId && (
-        <section>
-          <h2>
-            Logs —{" "}
-            {deployments.find((d) => d.id === activeLogId)?.name ?? activeLogId}
+        <section className="section log-panel">
+          <div className="log-panel-header">
+            <div className="log-panel-title">
+              <div className="log-panel-dots" aria-hidden="true">
+                <span className="log-dot log-dot--red" />
+                <span className="log-dot log-dot--yellow" />
+                <span className="log-dot log-dot--green" />
+              </div>
+              <span className="log-panel-name">
+                logs — {activeDeploymentName}
+              </span>
+            </div>
             <button
+              className="btn-close-logs"
               onClick={() => setActiveLogId(null)}
-              style={{ marginLeft: "1rem", fontSize: "0.8rem" }}
+              aria-label="Close log panel"
             >
               close
             </button>
-          </h2>
+          </div>
           <div
-            style={{
-              background: "#111",
-              color: "#eee",
-              padding: "1rem",
-              height: 400,
-              overflowY: "scroll",
-              marginTop: "0.5rem",
-              fontSize: "0.85rem",
-              lineHeight: 1.6,
-            }}
+            className="log-terminal"
+            role="log"
+            aria-live="polite"
+            aria-label="Deployment logs"
           >
+            {(logs[activeLogId] ?? []).length === 0 && (
+              <span className="log-empty">Waiting for logs…</span>
+            )}
             {(logs[activeLogId] ?? []).map((line, i) => (
-              <div key={i}>{line}</div>
+              <div key={i} className="log-line">
+                <span className="log-line-num">{i + 1}</span>
+                <span className="log-line-text">{line}</span>
+              </div>
             ))}
             <div ref={logEndRef} />
           </div>
@@ -248,21 +263,4 @@ export default function App() {
       )}
     </div>
   );
-}
-
-// Maps deployment status to a color for visual feedback.
-// This is the only "design" decision in this file — everything else is functional.
-function statusColor(status: Deployment["status"]): string {
-  switch (status) {
-    case "pending":
-      return "#999";
-    case "building":
-      return "#f0a500";
-    case "deploying":
-      return "#2196f3";
-    case "running":
-      return "#4caf50";
-    case "failed":
-      return "#f44336";
-  }
 }
