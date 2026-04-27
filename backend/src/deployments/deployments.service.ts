@@ -231,14 +231,24 @@ export class DeploymentsService {
   }
 
   private async updateCaddyRoute(id: string): Promise<void> {
-    const headers = { 'Content-Type': 'application/json', Origin: 'http://caddy:2019' };
+    const headers = {
+      'Content-Type': 'application/json',
+      Origin: 'http://caddy:2019',
+    };
     const base = 'http://caddy:2019/config/apps/http/servers/srv0/routes';
 
-    const existing = await fetch(base, { headers }).then((r) => r.json());
+    const existing = (await fetch(base, { headers }).then((r) =>
+      r.json(),
+    )) as unknown[];
 
     const newRoute = {
       match: [{ path: [`/deploy/${id}`, `/deploy/${id}/*`] }],
-      handle: [{ handler: 'reverse_proxy', upstreams: [{ dial: `deployment-${id}:3000` }] }],
+      handle: [
+        {
+          handler: 'reverse_proxy',
+          upstreams: [{ dial: `deployment-${id}:3000` }],
+        },
+      ],
     };
 
     // Prepend so the deployment route is evaluated before the frontend catch-all.
